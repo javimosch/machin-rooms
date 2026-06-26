@@ -1,0 +1,173 @@
+// machin-rooms — a self-hostable real-time chat server, in one MFL binary.
+//
+// Open the page, pick a room + a name, and chat live over WebSockets — messages,
+// join/leave notices, and a live member count, broadcast to everyone in the room. No
+// broker, no Node: the WebSocket server (handshake + RFC 6455 frame codec) is pure MFL
+// in framework/ws.src, and the fan-out is the same lock-free hub-goroutine pattern as
+// machin-live (a chan inside a struct + a []Sub registry).
+//
+// Each connection runs TWO goroutines: a reader (the ws handler loop) turning inbound
+// frames into "say" commands, and a writer draining the connection's outbound channel of
+// broadcasts. They share the fd (read + write are independent directions).
+//
+// Config (env): MACHROOMS_PORT (48500) · MACHROOMS_TITLE.
+
+type Sub struct {
+    id   string
+    room string
+    name string
+    out  chan string
+}
+
+type Cmd struct {
+    op   string         // "join" | "leave" | "say"
+    id   string
+    room string
+    name string
+    out  chan string
+    msg  string
+}
+
+var hub = make(chan Cmd)
+
+func cfg_port() (p) { p = 48500  e := env("MACHROOMS_PORT")  if e != "" { p = parse_int(e) } }
+func cfg_title() (t) { t = env("MACHROOMS_TITLE")  if t == "" { t = "machin-rooms" } }
+
+// ---- JSON message framing (what each client receives) ----
+
+func jesc(s) (r) {
+    r = replace(s, "\\", "\\\\")
+    r = replace(r, "\"", "\\\"")
+    r = replace(r, "\n", "\\n")
+    r = replace(r, "\r", "")
+    r = replace(r, "\t", " ")
+}
+func chat_json(room, name, text) (j) {
+    j = "{\"type\":\"msg\",\"room\":\"" + jesc(room) + "\",\"name\":\"" + jesc(name) + "\",\"text\":\"" + jesc(text) + "\"}"
+}
+func sys_json(room, text, count) (j) {
+    j = "{\"type\":\"sys\",\"room\":\"" + jesc(room) + "\",\"text\":\"" + jesc(text) + "\",\"count\":" + str(count) + "}"
+}
+
+// ---- the hub (single owner of the room registry) ----
+
+func count_room(subs, room) (n) {
+    n = 0
+    for _, s := range subs { if s.room == room { n = n + 1 } }
+}
+func broadcast(subs, room, payload) {
+    for _, s := range subs { if s.room == room { s.out <- payload } }   // out is unbounded -> never blocks
+}
+
+func hub_run() {
+    subs := []Sub{}
+    while 1 == 1 {
+        c := <-hub
+        if c.op == "join" {
+            subs = append(subs, Sub{id: c.id, room: c.room, name: c.name, out: c.out})
+            broadcast(subs, c.room, sys_json(c.room, c.name + " joined", count_room(subs, c.room)))
+        }
+        if c.op == "leave" {
+            ns := []Sub{}
+            for _, s := range subs { if s.id != c.id { ns = append(ns, s) } }
+            subs = ns
+            broadcast(subs, c.room, sys_json(c.room, c.name + " left", count_room(subs, c.room)))
+        }
+        if c.op == "say" {
+            broadcast(subs, c.room, chat_json(c.room, c.name, c.msg))
+        }
+    }
+}
+
+// ---- a connection ----
+
+// writer drains a connection's outbound channel and writes each broadcast as a WS text
+// frame, until the reader signals close or a write fails (client gone).
+func conn_writer(fd, out) {
+    while 1 == 1 {
+        m := <-out
+        if m == "__close__" { return }
+        n := ws_send_text(fd, m)
+        if n < 0 { return }
+    }
+}
+
+func room_ws(req) (res) {
+    room := query(req, "room")
+    if room == "" { room = "lobby" }
+    name := query(req, "name")
+    if name == "" { name = "anon-" + to_hex(rand_bytes(2)) }
+    res = ws(req, func(c) {
+        id := to_hex(rand_bytes(8))
+        out := make(chan string)
+        hub <- Cmd{op: "join", id: id, room: room, name: name, out: out}
+        go conn_writer(c.fd, out)
+        while 1 == 1 {
+            text, ok := ws_next_text(c)
+            if ok == 0 { break }                       // client closed / EOF
+            if text != "" { hub <- Cmd{op: "say", room: room, name: name, msg: text} }
+        }
+        hub <- Cmd{op: "leave", id: id, room: room, name: name, out: out}
+        out <- "__close__"                             // stop the writer goroutine
+    })
+}
+
+// ---- the web client ----
+
+func page() (h) {
+    title := cfg_title()
+    h = "<!doctype html><html><head><meta charset=\"utf-8\">" +
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
+        "<title>" + title + "</title><style>" +
+        "*{box-sizing:border-box}body{font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;margin:0;height:100vh;display:flex;flex-direction:column;background:#0f1115;color:#d7dbe0}" +
+        "header{padding:.7rem 1rem;background:#171a21;border-bottom:1px solid #262b36;display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}" +
+        "header h1{font-size:1rem;margin:0 .5rem 0 0;color:#fff}.count{margin-left:auto;color:#7d8590;font-size:.85rem}" +
+        "input,button{font:inherit}input{background:#0f1115;border:1px solid #2b313c;color:#d7dbe0;border-radius:6px;padding:.35rem .5rem}" +
+        "button{background:#1f6feb;color:#fff;border:0;border-radius:6px;padding:.4rem .9rem;cursor:pointer}button:hover{background:#388bfd}" +
+        "#log{flex:1;overflow:auto;padding:1rem;margin:0;list-style:none}#log li{padding:.2rem 0}" +
+        ".nm{color:#58a6ff;font-weight:600}.sys{color:#6e7681;font-style:italic}.dot{width:9px;height:9px;border-radius:50%;background:#555;display:inline-block;margin-right:.2rem}.dot.on{background:#3fb950}" +
+        "footer{display:flex;gap:.5rem;padding:.7rem 1rem;background:#171a21;border-top:1px solid #262b36}#msg{flex:1}" +
+        "</style></head><body>" +
+        "<header><span class=\"dot\" id=\"st\"></span><h1>" + title + "</h1>" +
+        "<input id=\"room\" value=\"lobby\" style=\"width:7rem\" placeholder=\"room\">" +
+        "<input id=\"name\" placeholder=\"your name\" style=\"width:8rem\">" +
+        "<button onclick=\"join()\">Join</button><span class=\"count\" id=\"count\"></span></header>" +
+        "<ul id=\"log\"></ul>" +
+        "<footer><input id=\"msg\" placeholder=\"type a message and press Enter\" autocomplete=\"off\"><button onclick=\"send()\">Send</button></footer>" +
+        "<script>" +
+        "let ws=null;" +
+        "function esc(s){return s.replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}" +
+        "function add(html){const l=document.getElementById('log');const li=document.createElement('li');li.innerHTML=html;l.appendChild(li);l.scrollTop=l.scrollHeight}" +
+        "function join(){if(ws)ws.close();" +
+        "const room=document.getElementById('room').value.trim()||'lobby';" +
+        "const name=document.getElementById('name').value.trim()||('anon'+Math.floor(Math.random()*1000));" +
+        "const proto=location.protocol==='https:'?'wss':'ws';" +
+        "ws=new WebSocket(proto+'://'+location.host+'/ws?room='+encodeURIComponent(room)+'&name='+encodeURIComponent(name));" +
+        "const st=document.getElementById('st');" +
+        "ws.onopen=()=>{st.classList.add('on');add('<span class=sys>connected to #'+esc(room)+'</span>')};" +
+        "ws.onclose=()=>{st.classList.remove('on');add('<span class=sys>disconnected</span>')};" +
+        "ws.onmessage=e=>{const d=JSON.parse(e.data);" +
+        "if(d.type==='sys'){add('<span class=sys>'+esc(d.text)+'</span>');document.getElementById('count').textContent=d.count+' online'}" +
+        "else{add('<span class=nm>'+esc(d.name)+':</span> '+esc(d.text))}};}" +
+        "function send(){const m=document.getElementById('msg');if(ws&&ws.readyState===1&&m.value){ws.send(m.value);m.value=''}}" +
+        "document.getElementById('msg').addEventListener('keydown',e=>{if(e.key==='Enter')send()});" +
+        "join();" +
+        "</script></body></html>"
+}
+
+func handle(req) (res) {
+    if is_ws_request(req) == 1 { res = room_ws(req)  return }
+    p := req.path
+    qi := index(p, "?")
+    if qi >= 0 { p = substr(p, 0, qi) }
+    if p == "/_health" { res = ok_json("{\"ok\":true,\"service\":\"machin-rooms\"}")  return }
+    if p == "/" { res = ok_html(page())  return }
+    res = not_found()
+}
+
+func main() {
+    go hub_run()
+    port := cfg_port()
+    println("machin-rooms on http://localhost:" + str(port) + "  (WebSocket chat at /ws?room=&name=)")
+    serve(port, func(req) { return handle(req) })
+}
