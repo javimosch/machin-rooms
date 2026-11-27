@@ -31,7 +31,11 @@ See `machin guide --skill web` for the WebSocket how-to.
 Fan-out is the idiomatic **lock-free hub goroutine**: one `hub_run()` owns the `[]Sub`
 room registry; `join` / `leave` / `say` commands arrive over a channel and it broadcasts
 each message to every subscriber in the room (each subscriber has its own unbounded
-delivery channel, so the hub never blocks). 
+delivery channel, so the hub never blocks).
+
+A goroutine's memory is only freed when it returns, so the hub periodically hands the
+member list to a fresh goroutine and exits. Keep that in mind when changing `hub_run`:
+whatever it allocates must either be part of the handover or be disposable.
 
 Each connection runs **two goroutines** over the shared socket — read and write are
 independent directions:
@@ -73,12 +77,35 @@ async def main():
 asyncio.run(main())
 ```
 
+## Limits
+
+| What | Limit | When exceeded |
+|---|---|---|
+| chat message | 128 KiB | connection closed (1009) |
+| room / user name | 64 / 32 bytes | cut at a UTF-8 character boundary |
+| queued for one member | about 8 MiB (progress is reported in 256 KiB steps) | that member is disconnected |
+| messages in flight per sender | 1 | the sender's socket is not read until it is fanned out |
+| declared HTTP request body | 64 KiB | not read |
+
+## Tests
+
+`./build.sh && python3 tests/load.py` checks message integrity under concurrent load, that
+memory levels off under sustained messages and connect/disconnect churn, and the limits
+above. Linux and Python 3 only; `--quick` runs about a tenth of the load (without the
+plateau check).
+
 ## v1 scope (honest edges)
 
 - **No auth / no history.** Anyone who can reach it can join any room; messages aren't
   persisted (a fresh tab starts empty). machin has signed sessions + SSO (gate `/ws`) and
   SQLite/Redis (persist + replay scrollback) if you want them — see
   `machin guide --skill backend`.
+- **No connection limit, idle timeout or rate limit.** Each connection costs two threads and
+  may queue up to the backlog limit, so cap connections in a reverse proxy.
+- **A client that sends pings while it is far behind on reading** can find its own stream
+  garbled: pongs and messages are written to the socket by different goroutines.
+- **Message text is not validated** as UTF-8, and control characters other than newline,
+  tab and carriage return are not escaped.
 - **Text frames** (chat). Binary frames are received (`ws_send_bytes` exists) but the app
   treats messages as text.
 - Behind a proxy use `wss://` (the client picks `ws`/`wss` from the page's scheme) and

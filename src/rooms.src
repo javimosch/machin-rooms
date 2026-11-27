@@ -13,22 +13,49 @@
 // Config (env): MACHROOMS_PORT (48500) · MACHROOMS_TITLE.
 
 type Sub struct {
-    id   string
-    room string
-    name string
-    out  chan string
+    id      string
+    room    string
+    name    string
+    out     chan string
+    fd      int
+    pending int       // bytes queued to this member and not yet reported written; -1 = dropped
 }
 
 type Cmd struct {
-    op   string         // "join" | "leave" | "say"
+    op   string         // "join" | "leave" | "say" | "sent"
     id   string
     room string
     name string
     out  chan string
+    done chan int       // "say": the hub signals it once the message is fanned out
+    fd   int
+    n    int            // "sent": bytes the writer has finished with
     msg  string
 }
 
 var hub = make(chan Cmd)
+
+// Limits on what an unauthenticated client can make the server hold.
+var max_message = 131072      // one chat message, bytes
+var max_room = 64             // room name, bytes
+var max_name = 32             // user name, bytes
+var max_backlog = 8388608     // queued for one member before it is disconnected, bytes
+var report_every = 262144     // a writer reports progress to the hub this often, bytes
+
+extern "c" {
+    header "sys/socket.h"
+    fn shutdown(i32, i32) i32
+}
+
+// clip cuts s to at most max bytes without splitting a UTF-8 character.
+func clip(s, max) (r) {
+    r = s
+    if len(s) <= max { return }
+    b := bytes(substr(s, 0, max + 1))
+    n := max
+    while n > 0 && (byte_at(b, n) & 192) == 128 { n = n - 1 }
+    r = substr(s, 0, n)
+}
 
 func cfg_port() (p) { p = 48500  e := env("MACHROOMS_PORT")  if e != "" { p = parse_int(e) } }
 func cfg_title() (t) { t = env("MACHROOMS_TITLE")  if t == "" { t = "machin-rooms" } }
@@ -55,68 +82,137 @@ func count_room(subs, room) (n) {
     n = 0
     for _, s := range subs { if s.room == room { n = n + 1 } }
 }
+// broadcast queues payload for every member of room. Delivery channels are unbounded so
+// the hub never blocks; a member whose backlog passes max_backlog is disconnected instead.
 func broadcast(subs, room, payload) {
-    for _, s := range subs { if s.room == room { s.out <- payload } }   // out is unbounded -> never blocks
+    i := 0
+    while i < len(subs) {
+        s := subs[i]
+        if s.room == room && s.pending >= 0 {
+            queued := s.pending + len(payload)
+            if queued > max_backlog {
+                queued = -1
+                x := shutdown(s.fd, 2)      // its reader and writer fail, then it leaves
+            } else {
+                s.out <- payload
+            }
+            s.pending = queued
+            subs[i] = s
+        }
+        i = i + 1
+    }
 }
 
-func hub_run() {
+// The hub's memory is only reclaimed when its goroutine returns, and membership has to
+// outlive any arena { } block. So after allocating about a budget's worth, the hub hands
+// the member list to a fresh goroutine and returns, which frees everything it allocated.
+// Commands wait in `hub` meanwhile, in order. inbox carries the n members handed over.
+func hub_run(inbox, n) {
     subs := []Sub{}
-    while 1 == 1 {
+    k := 0
+    while k < n {
+        s := <-inbox
+        subs = append(subs, s)
+        k = k + 1
+    }
+    chan_free(inbox)                        // the previous hub is done with it
+    budget := 2097152 + n * 2048
+    spent := 0
+    while spent < budget {
         c := <-hub
+        spent = spent + 1024 + len(c.msg) * 12 + len(subs) * 160
         if c.op == "join" {
-            subs = append(subs, Sub{id: c.id, room: c.room, name: c.name, out: c.out})
+            subs = append(subs, Sub{id: c.id, room: c.room, name: c.name, out: c.out, fd: c.fd, pending: 0})
             broadcast(subs, c.room, sys_json(c.room, c.name + " joined", count_room(subs, c.room)))
         }
         if c.op == "leave" {
             ns := []Sub{}
             for _, s := range subs { if s.id != c.id { ns = append(ns, s) } }
             subs = ns
+            c.out <- "__close__"            // last send: the writer now frees the channel
             broadcast(subs, c.room, sys_json(c.room, c.name + " left", count_room(subs, c.room)))
         }
         if c.op == "say" {
             broadcast(subs, c.room, chat_json(c.room, c.name, c.msg))
+            c.done <- 1
+        }
+        if c.op == "sent" {
+            i := 0
+            while i < len(subs) {
+                s := subs[i]
+                if s.id == c.id && s.pending >= 0 {
+                    s.pending = s.pending - c.n
+                    subs[i] = s
+                }
+                i = i + 1
+            }
         }
     }
+    next := make(chan Sub)
+    go hub_run(next, len(subs))
+    for _, s := range subs { next <- s }
 }
 
 // ---- a connection ----
 
 // writer drains a connection's outbound channel and writes each broadcast as a WS text
-// frame, until the reader signals close or a write fails (client gone).
-func conn_writer(fd, out) {
+// frame, until the hub sends "__close__". After a failed write it keeps draining, so
+// nothing piles up, and it owns the channel's release.
+func conn_writer(fd, id, out, done) {
     open := 1
+    alive := 1
+    unreported := 0
     while open == 1 {
         arena {                                        // frees each broadcast's frame
             m := <-out
             if m == "__close__" {
                 open = 0
             } else {
-                if ws_send_text(fd, m) < 0 { open = 0 }
+                if alive == 1 {
+                    f := ws_frame(1, bytes(m))
+                    if write_bytes(fd, f) < len(f) {
+                        alive = 0
+                        x := shutdown(fd, 2)           // ends the reader too
+                    }
+                    unreported = unreported + len(m)
+                    if unreported >= report_every {
+                        hub <- Cmd{op: "sent", id: id, n: unreported}
+                        unreported = 0
+                    }
+                }
             }
         }
     }
+    chan_free(out)
+    done <- 1                                          // the fd is no longer in use here
 }
 
 func room_ws(req) (res) {
-    room := query(req, "room")
+    room := clip(query(req, "room"), max_room)
     if room == "" { room = "lobby" }
-    name := query(req, "name")
+    name := clip(query(req, "name"), max_name)
     if name == "" { name = "anon-" + to_hex(rand_bytes(2)) }
     res = ws(req, func(c) {
         id := to_hex(rand_bytes(8))
         out := make(chan string)
-        hub <- Cmd{op: "join", id: id, room: room, name: name, out: out}
-        go conn_writer(c.fd, out)
+        done := make(chan int)      // from the hub after each "say", from the writer at the end
+        hub <- Cmd{op: "join", id: id, room: room, name: name, out: out, fd: c.fd}
+        go conn_writer(c.fd, id, out, done)
         open := 1
         while open == 1 {
             arena {                                    // frees each message's memory
                 text, ok := ws_next_text(c)
                 open = ok                              // 0 = client closed / EOF
-                if ok == 1 && text != "" { hub <- Cmd{op: "say", room: room, name: name, msg: text} }
+                if ok == 1 && text != "" {
+                    hub <- Cmd{op: "say", room: room, name: name, done: done, msg: text}
+                    x := <-done                        // one in flight: a flood can't fill `hub`
+                }
             }
         }
+        y := shutdown(c.fd, 2)  // unblocks a writer stuck on a client that stopped reading
         hub <- Cmd{op: "leave", id: id, room: room, name: name, out: out}
-        out <- "__close__"                             // stop the writer goroutine
+        x := <-done        // machweb closes the fd when we return; the writer must be done
+        chan_free(done)
     })
 }
 
@@ -174,7 +270,9 @@ func handle(req) (res) {
 }
 
 func main() {
-    go hub_run()
+    ws_set_max_message(max_message)
+    set_max_body(65536)                 // no route takes a body
+    go hub_run(make(chan Sub), 0)
     port := cfg_port()
     println("machin-rooms on http://localhost:" + str(port) + "  (WebSocket chat at /ws?room=&name=)")
     serve(port, func(req) { return handle(req) })
