@@ -84,11 +84,16 @@ func hub_run() {
 // writer drains a connection's outbound channel and writes each broadcast as a WS text
 // frame, until the reader signals close or a write fails (client gone).
 func conn_writer(fd, out) {
-    while 1 == 1 {
-        m := <-out
-        if m == "__close__" { return }
-        n := ws_send_text(fd, m)
-        if n < 0 { return }
+    open := 1
+    while open == 1 {
+        arena {                                        // frees each broadcast's frame
+            m := <-out
+            if m == "__close__" {
+                open = 0
+            } else {
+                if ws_send_text(fd, m) < 0 { open = 0 }
+            }
+        }
     }
 }
 
@@ -102,10 +107,13 @@ func room_ws(req) (res) {
         out := make(chan string)
         hub <- Cmd{op: "join", id: id, room: room, name: name, out: out}
         go conn_writer(c.fd, out)
-        while 1 == 1 {
-            text, ok := ws_next_text(c)
-            if ok == 0 { break }                       // client closed / EOF
-            if text != "" { hub <- Cmd{op: "say", room: room, name: name, msg: text} }
+        open := 1
+        while open == 1 {
+            arena {                                    // frees each message's memory
+                text, ok := ws_next_text(c)
+                open = ok                              // 0 = client closed / EOF
+                if ok == 1 && text != "" { hub <- Cmd{op: "say", room: room, name: name, msg: text} }
+            }
         }
         hub <- Cmd{op: "leave", id: id, room: room, name: name, out: out}
         out <- "__close__"                             // stop the writer goroutine

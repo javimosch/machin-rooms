@@ -6,7 +6,7 @@ tiny self-hosted team chat / live-presence widget for an SME — one static nati
 no message broker, no Node. Built in pure [MFL](https://github.com/javimosch/machin).
 
 ```bash
-./build.sh                      # -> ./machin-rooms   (needs machin v0.79.0+ and a C compiler)
+./build.sh                      # -> ./machin-rooms   (needs machin v0.146.1+ and a C compiler)
 ./machin-rooms                  # http://localhost:48500  — open it in two tabs and chat
 ```
 
